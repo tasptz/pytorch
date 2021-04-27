@@ -22,6 +22,9 @@ using caffe2::serialize::PyTorchStreamReader;
 using caffe2::serialize::ReadAdapterInterface;
 
 namespace {
+static constexpr const char* kArchiveNameConstants = "constants";
+static constexpr const char* kArchiveNameBytecode = "bytecode";
+static constexpr int64_t kBytecodeVersionV4 = 0x4L;
 
 TypePtr resolveTypeName(
     std::shared_ptr<CompilationUnit>& compilation_unit,
@@ -103,10 +106,104 @@ c10::IValue readArchive(
   return ivalues;
 }
 
-bool check_zip_file(std::shared_ptr<ReadAdapterInterface>& rai) {
+TensorIndexMap get_tensors_archive_table(const IValue& value) {
+  std::vector<char> data;
+  TensorIndexMap tensors_archive_table;
+  TypeNameUniquer type_name_uniquer;
+  // Vector to capture the run-time class types during pickling the IValues
+  std::vector<c10::ClassTypePtr> memoizedClassTypes;
+  Pickler data_pickle(
+      [&](const char* buf, size_t size) {
+        data.insert(data.end(), buf, buf + size);
+      },
+      nullptr,
+      [&](const c10::ClassTypePtr& t) {
+        return type_name_uniquer.getUniqueName(t);
+      },
+      &memoizedClassTypes);
+  data_pickle.protocol();
+  data_pickle.pushIValue(value);
+  data_pickle.stop();
+
+  const auto tensor_candidates = data_pickle.tensorData();
+  for (size_t tensor_index = 0; tensor_index < tensor_candidates.size();
+       tensor_index++) {
+    tensors_archive_table[tensor_candidates[tensor_index]] =
+        std::make_pair(kArchiveNameConstants, tensor_index);
+  }
+  return tensors_archive_table;
+}
+
+void writeArchive(
+    std::shared_ptr<PyTorchStreamWriter> writer,
+    const std::string& archive_name,
+    const IValue& value,
+    TensorIndexMap& tensors_archive_table,
+    bool use_tensors_archive_table = false) {
+  std::vector<char> data;
+  TypeNameUniquer type_name_uniquer;
+  // Vector to capture the run-time class types during pickling the IValues
+  std::vector<c10::ClassTypePtr> memoizedClassTypes;
+  Pickler data_pickle(
+      [&](const char* buf, size_t size) {
+        data.insert(data.end(), buf, buf + size);
+      },
+      nullptr,
+      [&](const c10::ClassTypePtr& t) {
+        return type_name_uniquer.getUniqueName(t);
+      },
+      &memoizedClassTypes);
+  if (use_tensors_archive_table && !tensors_archive_table.empty()) {
+    data_pickle.updateTensorsArchiveTable(tensors_archive_table);
+  }
+  data_pickle.protocol();
+  data_pickle.pushIValue(value);
+  data_pickle.stop();
+  size_t i = 0;
+  std::string prefix = archive_name + "/";
+
+  // TODO: currently there exists logic only for archive constant and
+  // bytecode, to avoid exporting duplicate tensors. The logic can be more
+  // generic such that it can be used by other tensors from other archive, to
+  // avoid deduplicating tensors among different archives.
+
+  // Store all tensors from archives `constants` to tensors_archive_table
+  if (archive_name == kArchiveNameConstants) {
+    const auto tensor_candidates = data_pickle.tensorData();
+    for (size_t tensor_index = 0; tensor_index < tensor_candidates.size();
+         tensor_index++) {
+      tensors_archive_table[tensor_candidates[tensor_index]] =
+          std::make_pair(kArchiveNameConstants, tensor_index);
+    }
+  }
+
+  // Export deduplicate tensors only if use_tensors_archive_table is set to
+  // true and archive name is `bytecode`
+  bool can_use_tensors_archive_table =
+      (use_tensors_archive_table && archive_name == kArchiveNameBytecode);
+
+  for (const auto& td : data_pickle.tensorData()) {
+    WriteableTensorData writable_td = getWriteableTensorData(td);
+    std::string fname = prefix + c10::to_string(i++);
+    if (can_use_tensors_archive_table) {
+      const auto found = tensors_archive_table.find(td);
+      if (found == tensors_archive_table.end()) {
+        writer->writeRecord(
+            fname, writable_td.data(), writable_td.sizeInBytes());
+      }
+    } else {
+      writer->writeRecord(fname, writable_td.data(), writable_td.sizeInBytes());
+    }
+  }
+  std::string fname = archive_name + ".pkl";
+  writer->writeRecord(fname, data.data(), data.size());
+}
+
+void check_zip_file(std::shared_ptr<ReadAdapterInterface>& rai) {
   std::array<uint8_t, 2> first_short{};
   static constexpr uint8_t first_slot = 0x80;
   static constexpr uint8_t second_slot = 0x02;
+
   rai->read(
       /*pos=*/0,
       /*buf=*/&first_short,
@@ -126,7 +223,7 @@ bool check_zip_file(std::shared_ptr<ReadAdapterInterface>& rai) {
 
 std::vector<IValue> get_bytecode_vals(
     std::shared_ptr<mobile::CompilationUnit>& mobile_compilation_unit,
-    PyTorchStreamReader& reader) {
+    std::unique_ptr<caffe2::serialize::PyTorchStreamReader>& reader) {
   std::vector<IValue> bytecode_vals;
   bytecode_vals = readArchive("bytecode", mobile_compilation_unit, reader)
                       .toTuple()
@@ -134,7 +231,121 @@ std::vector<IValue> get_bytecode_vals(
   return bytecode_vals;
 }
 
+void update_bytecode_version(
+    std::vector<IValue>& bytecode_values,
+    const int64_t to_version) {
+  if (!bytecode_values.empty() && bytecode_values[0].isInt()) {
+    bytecode_values[0] = IValue(to_version);
+  }
+}
+
 } // namespace
+
+// Forward declare so that _backport_for_mobile() overloads can
+// call this method directly.
+bool _backport_for_mobile_impl(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::shared_ptr<PyTorchStreamWriter> writer);
+
+bool _backport_for_mobile(std::istream& in, std::ostream& out) {
+  std::unique_ptr<IStreamAdapter> rai = std::make_unique<IStreamAdapter>(&in);
+  auto writer_func = [&](const void* buf, size_t nbytes) -> size_t {
+    out.write(static_cast<const char*>(buf), nbytes);
+    return !out ? 0 : nbytes;
+  };
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(writer_func);
+  return _backport_for_mobile(std::move(rai), std::move(writer));
+}
+
+bool _backport_for_mobile(
+    std::istream& in,
+    const std::string& output_filename) {
+  std::unique_ptr<IStreamAdapter> rai = std::make_unique<IStreamAdapter>(&in);
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(output_filename);
+  return _backport_for_mobile(std::move(rai), std::move(writer));
+}
+
+bool _backport_for_mobile(
+    const std::string& input_filename,
+    std::ostream& out) {
+  std::unique_ptr<FileAdapter> rai =
+      std::make_unique<FileAdapter>(input_filename);
+  auto writer_func = [&](const void* buf, size_t nbytes) -> size_t {
+    out.write(static_cast<const char*>(buf), nbytes);
+    return !out ? 0 : nbytes;
+  };
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(std::move(writer_func));
+  return _backport_for_mobile_impl(std::move(rai), std::move(writer));
+}
+
+bool _backport_for_mobile(
+    const std::string& input_filename,
+    const std::string& output_filename) {
+  std::unique_ptr<FileAdapter> rai =
+      std::make_unique<FileAdapter>(input_filename);
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(output_filename);
+  return _backport_for_mobile_impl(std::move(rai), std::move(writer));
+}
+
+bool _backport_for_mobile(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::shared_ptr<PyTorchStreamWriter> writer) {
+  return _backport_for_mobile_impl(std::move(rai), std::move(writer));
+}
+
+bool _backport_for_mobile_impl(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::shared_ptr<PyTorchStreamWriter> writer) {
+  auto bytecode_version = _get_bytecode_version(rai);
+  auto to_bytecode_version = bytecode_version - 1;
+
+  if (to_bytecode_version == kBytecodeVersionV4) {
+    check_zip_file(rai);
+
+    auto reader = torch::make_unique<caffe2::serialize::PyTorchStreamReader>(
+        std::move(rai));
+    std::vector<IValue> bytecode_values;
+    auto mobile_compilation_unit = std::make_shared<mobile::CompilationUnit>();
+    bytecode_values = get_bytecode_vals(mobile_compilation_unit, reader);
+
+    auto records = reader->getAllRecords();
+
+    // Copy everything except bytecode related to new output
+    for (const auto& record : records) {
+      if (record.find(kArchiveNameBytecode) == std::string::npos) {
+        auto data_ptr = reader->getRecord(record);
+        auto data = std::get<0>(data_ptr).get();
+        auto size = std::get<1>(data_ptr);
+        writer->writeRecord(record, data, size);
+      }
+    }
+
+    std::vector<IValue> ivalues_from_constants_archive =
+        readArchive("constants", mobile_compilation_unit, reader)
+            .toTuple()
+            ->elements();
+
+    auto ivalues_tuple_from_constants_archive =
+        c10::ivalue::Tuple::create(ivalues_from_constants_archive);
+
+    // Update the bytecode version in bytecode.pkl
+    update_bytecode_version(bytecode_values, to_bytecode_version);
+    auto bytecode_tuple =
+        c10::ivalue::Tuple::create(std::move(bytecode_values));
+    TensorIndexMap tensors_archive_table =
+        get_tensors_archive_table(ivalues_tuple_from_constants_archive);
+    writeArchive(
+        writer, "bytecode", bytecode_tuple, tensors_archive_table, false);
+    return true;
+  }
+  TORCH_WARN(
+      "Backport doesn't support backport to version", to_bytecode_version);
+  return false;
+}
 
 int64_t _get_bytecode_version(std::istream& in) {
   std::unique_ptr<IStreamAdapter> rai = std::make_unique<IStreamAdapter>(&in);
@@ -147,9 +358,6 @@ int64_t _get_bytecode_version(const std::string& filename) {
 }
 
 int64_t _get_bytecode_version(std::shared_ptr<ReadAdapterInterface> rai) {
-  if (check_zip_file(rai)) {
-    return -1;
-  }
   auto mobile_compilation_unit = std::make_shared<mobile::CompilationUnit>();
   PyTorchStreamReader reader(std::move(rai));
   auto bvals = get_bytecode_vals(mobile_compilation_unit, reader);

@@ -11,6 +11,25 @@ namespace torch {
 namespace jit {
 using caffe2::serialize::ReadAdapterInterface;
 
+// The family of methods below load a serialized Mobile Module
+TORCH_API bool _backport_for_mobile(std::istream& in, std::ostream& out);
+
+TORCH_API bool _backport_for_mobile(
+    std::istream& in,
+    const std::string& output_filename);
+
+TORCH_API bool _backport_for_mobile(
+    const std::string& input_filename,
+    std::ostream& out);
+
+TORCH_API bool _backport_for_mobile(
+    const std::string& input_filename,
+    const std::string& output_filename);
+
+TORCH_API bool _backport_for_mobile(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::shared_ptr<PyTorchStreamWriter> writer);
+
 // The family of methods below to get version given bytecode model
 TORCH_API int64_t _get_bytecode_version(std::istream& in);
 
