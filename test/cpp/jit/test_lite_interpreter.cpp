@@ -6,6 +6,7 @@
 #include <torch/csrc/autograd/generated/variable_factories.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/frontend/resolver.h>
+#include <torch/csrc/jit/mobile/backport.h>
 #include <torch/csrc/jit/mobile/import.h>
 #include <torch/csrc/jit/mobile/module.h>
 #include <torch/csrc/jit/serialization/export.h>
@@ -573,6 +574,23 @@ TEST(LiteInterpreterTest, TwoSubmodulesModuleInfo) {
   std::unordered_set<std::string> expected_result(
       {"top(C).forward", "top(C).A0(A).forward", "top(C).B0(B).forward"});
   AT_ASSERT(module_debug_info_set == expected_result);
+}
+
+TEST(LiteInterpreterTest, GetByteCodeVersion) {
+  std::string filePath(__FILE__);
+  auto test_model_file_v4 =
+      filePath.substr(0, filePath.find_last_of("/\\") + 1);
+  test_model_file_v4.append("script_module_v4.ptl");
+
+  auto test_model_file_v5 =
+      filePath.substr(0, filePath.find_last_of("/\\") + 1);
+  test_model_file_v5.append("script_module_v5.ptl");
+
+  auto version_v4 = torch::jit::_get_bytecode_version(test_model_file_v4);
+  AT_ASSERT(version_v4 == 4);
+
+  auto version_v5 = torch::jit::_get_bytecode_version(test_model_file_v5);
+  AT_ASSERT(version_v5 == 5);
 }
 
 TEST(LiteInterpreterTest, SequentialModuleInfo) {
