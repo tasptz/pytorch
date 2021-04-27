@@ -649,7 +649,7 @@ def configure_extension_build():
     if IS_WINDOWS:
         # /NODEFAULTLIB makes sure we only link to DLL runtime
         # and matches the flags set for protobuf and ONNX
-        extra_link_args = ['/NODEFAULTLIB:LIBCMT.LIB']
+        extra_link_args = ['/NODEFAULTLIB:LIBCMT.LIB', '/OPT:REF']
         # /MD links against DLL runtime
         # and matches the flags set for protobuf and ONNX
         # /EHsc is about standard C++ exception handling
