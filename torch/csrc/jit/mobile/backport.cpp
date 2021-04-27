@@ -8,6 +8,7 @@
 
 #include <exception>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace c10 {
@@ -25,6 +26,8 @@ namespace {
 static constexpr const char* kArchiveNameConstants = "constants";
 static constexpr const char* kArchiveNameBytecode = "bytecode";
 static constexpr int64_t kBytecodeVersionV4 = 0x4L;
+static std::unordered_set<int64_t> kByteCodeBackPortToVersions = {
+    kBytecodeVersionV4};
 
 TypePtr resolveTypeName(
     std::shared_ptr<CompilationUnit>& compilation_unit,
@@ -189,14 +192,15 @@ void writeArchive(
       const auto found = tensors_archive_table.find(td);
       if (found == tensors_archive_table.end()) {
         writer->writeRecord(
-            fname, writable_td.data(), writable_td.sizeInBytes());
+            fname, writable_td.data(), writable_td.sizeInBytes(), true);
       }
     } else {
-      writer->writeRecord(fname, writable_td.data(), writable_td.sizeInBytes());
+      writer->writeRecord(
+          fname, writable_td.data(), writable_td.sizeInBytes(), true);
     }
   }
   std::string fname = archive_name + ".pkl";
-  writer->writeRecord(fname, data.data(), data.size());
+  writer->writeRecord(fname, data.data(), data.size(), true);
 }
 
 void check_zip_file(std::shared_ptr<ReadAdapterInterface>& rai) {
@@ -345,6 +349,93 @@ bool _backport_for_mobile_impl(
   TORCH_WARN(
       "Backport doesn't support backport to version", to_bytecode_version);
   return false;
+}
+
+// Forward declare so that _backport_for_mobile() overloads can
+// call this method directly.
+bool _backport_to_version_for_mobile_impl(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::shared_ptr<PyTorchStreamWriter> writer,
+    const int64_t to_version);
+
+bool _backport_to_version_for_mobile(
+    std::istream& in,
+    std::ostream& out,
+    const int64_t to_version) {
+  std::unique_ptr<IStreamAdapter> rai = std::make_unique<IStreamAdapter>(&in);
+  auto writer_func = [&](const void* buf, size_t nbytes) -> size_t {
+    out.write(static_cast<const char*>(buf), nbytes);
+    return !out ? 0 : nbytes;
+  };
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(writer_func);
+  return _backport_to_version_for_mobile(
+      std::move(rai), std::move(writer), to_version);
+}
+
+bool _backport_to_version_for_mobile(
+    std::istream& in,
+    const std::string& output_filename,
+    const int64_t to_version) {
+  std::unique_ptr<IStreamAdapter> rai = std::make_unique<IStreamAdapter>(&in);
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(output_filename);
+  return _backport_to_version_for_mobile(
+      std::move(rai), std::move(writer), to_version);
+}
+
+bool _backport_to_version_for_mobile(
+    const std::string& input_filename,
+    std::ostream& out,
+    const int64_t to_version) {
+  std::unique_ptr<FileAdapter> rai =
+      std::make_unique<FileAdapter>(input_filename);
+  auto writer_func = [&](const void* buf, size_t nbytes) -> size_t {
+    out.write(static_cast<const char*>(buf), nbytes);
+    return !out ? 0 : nbytes;
+  };
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(std::move(writer_func));
+  return _backport_to_version_for_mobile_impl(
+      std::move(rai), std::move(writer), to_version);
+}
+
+bool _backport_to_version_for_mobile(
+    const std::string& input_filename,
+    const std::string& output_filename,
+    const int64_t to_version) {
+  std::unique_ptr<FileAdapter> rai =
+      std::make_unique<FileAdapter>(input_filename);
+  std::unique_ptr<PyTorchStreamWriter> writer =
+      std::make_unique<PyTorchStreamWriter>(output_filename);
+  return _backport_to_version_for_mobile_impl(
+      std::move(rai), std::move(writer), to_version);
+}
+
+bool _backport_to_version_for_mobile(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::unique_ptr<PyTorchStreamWriter> writer,
+    const int64_t to_version) {
+  return _backport_to_version_for_mobile_impl(
+      std::move(rai), std::move(writer), to_version);
+}
+
+bool _backport_to_version_for_mobile_impl(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::shared_ptr<PyTorchStreamWriter> writer,
+    const int64_t to_version) {
+  std::cout << "backporting to version" << std::endl;
+  const auto bytecode_version = _get_bytecode_version(rai);
+  bool backport_success = true;
+  if (kByteCodeBackPortToVersions.find(to_version) !=
+      kByteCodeBackPortToVersions.end()) {
+    for (auto version = bytecode_version; version > to_version; version--) {
+      backport_success &= _backport_for_mobile(rai, writer);
+    }
+  } else {
+    backport_success = false;
+  }
+  return backport_success;
 }
 
 int64_t _get_bytecode_version(std::istream& in) {
